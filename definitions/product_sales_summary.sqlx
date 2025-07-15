@@ -1,0 +1,90 @@
+config {
+  type: "table",  // 创建最终的表
+  schema: "fba_restock_dataset",  // 替换为您的数据集名称
+  name: "productsales_fba_60d",
+  tags: ["产品销量底数", "备货模型"] 
+}
+
+# 每天早上7点更新
+with ske_name as
+(select sku as SPU,
+productName as product_name
+ from 
+(select 
+row_number()over(partition by sku order by sku,productName desc) as c,
+*
+from
+(SELECT
+distinct 
+sku,
+productName,
+FROM (select distinct * from `articulate-sol-302205.hwc_data_ritfit.jijia_erp_order_list_detail` h  
+,unnest(h.itemVos) ))
+) where c =1),
+
+
+sales_base as
+
+(SELECT 
+date(purchaseDate) as purchaseDate,
+shipmentWarehouse,
+'FBA' as delivery_method,
+case when marketId = 5 then 'US_FBA'
+     when marketId = 1 then 'US_FBA'
+     when marketId = 9 then 'JP_FBA'
+     when marketId = 2 then 'CA_FBA'
+  else 'Other'end as channel_group,
+sku,
+sellerSku,
+sum(quantityOrdered) as quantityOrdered,
+FROM (select distinct * from `articulate-sol-302205.hwc_data_ritfit.jijia_erp_order_list_detail` h  
+,unnest(h.itemVos) itemVos where 
+date(purchaseDate) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY) and 
+shipFulfillment = 'AFN' ) t # 是否筛选状态
+group by 
+purchaseDate,
+shipmentWarehouse,
+shipFulfillment,
+orderStatus,
+sku,
+sellerSku,
+channel_group ),
+
+sales_base_v2 as 
+(SELECT
+delivery_method,
+sourceChannel,
+sale_date,
+SPU,
+sum(sales_quantity) as sales_quantity
+from
+
+(    SELECT
+        delivery_method,
+        channel_group as sourceChannel,
+        sku,
+        if(sku="",sellerSku,sku) AS SPU,
+        DATE(purchaseDate) AS sale_date,
+        SUM(quantityOrdered) AS sales_quantity
+    FROM
+        sales_base AS t1
+    GROUP BY
+        delivery_method,
+        sourceChannel,
+        sku, sale_date, SPU
+)
+  GROUP BY sourceChannel,sale_date,SPU,delivery_method)
+
+select 
+  sale_date,
+  SPU,
+  product_name,
+  sourceChannel,
+  SUM(sales_quantity) as sales_quantity,
+from sales_base_v2 a
+left join ske_name b using(SPU)
+group by
+  sale_date,
+  SPU,
+  product_name,
+  sourceChannel

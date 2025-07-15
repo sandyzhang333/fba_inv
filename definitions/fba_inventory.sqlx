@@ -1,0 +1,74 @@
+config {
+  type: "table",  
+  schema: "fba_restock_dataset",  
+  name: "fba_inventory",
+  tags: ["产品库存", "备货模型"]
+}
+
+# 库存表 早上8点更新 
+select 
+date(updateTime) as updateTime,
+sku,
+skuName,
+'FBA' as warehouseType,
+warehouseName,
+right(warehouseName,6) sourcechannel,
+sum(inventoryQuantity) as inventoryQuantity,
+sum(inventoryTotalAmount) as inventoryTotalAmount,
+sum(goodAvailableQuantity) as on_hand_quantity,
+sum(onInventoryAmount) as on_hand_amount,
+sum(inboundQuantity) as transit_inventory,
+sum(inboundAmount) as transit_amount,
+sum(inventoryAge0to1Month) inventoryAge0to1Month,
+sum(inventoryAge0to3Month) inventoryAge0to3Month,
+sum(inventoryAge12MonthUp) inventoryAge12MonthUp,
+sum(inventoryAge1to2Month) inventoryAge1to2Month,
+sum(inventoryAge2to3Month) inventoryAge2to3Month,
+sum(inventoryAge3to6Month) inventoryAge3to6Month,
+sum(inventoryAge6to9Month) inventoryAge6to9Month,
+sum(inventoryAge9to12Month) inventoryAge9to12Month
+from (
+SELECT distinct 
+updateDate, #时间戳
+updateTime, #[yyyy-MM-dd HH:mm:ss]
+rank()over(partition by
+warehouseName,
+sku,skuName,
+spu,spuName,
+msku,asin,
+fnsku,
+productStateName order by updateDate desc) max_date,
+CASE
+  WHEN spu IS NULL THEN COALESCE(sku, msku)
+  ELSE spu
+END AS s_spu,
+warehouseId,
+warehouseName,
+sku,skuName,
+inboundQuantity,
+inboundAmount,
+inventoryQuantity,
+inventoryTotalAmount,
+goodAvailableQuantity,
+onInventoryAmount,
+inventoryAge0to1Month,
+inventoryAge0to3Month,
+inventoryAge12MonthUp,
+inventoryAge1to2Month,
+inventoryAge2to3Month,
+inventoryAge3to6Month,
+inventoryAge6to9Month,
+inventoryAge9to12Month,
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_store_inventory` 
+where 
+-- date(updateTime) = (select max(date(updateTime)) from `articulate-sol-302205.hwc_data_ritfit.jijia_erp_store_inventory` ) 
+-- and
+-- date(updateTime) = '2025-02-11'
+ warehouseName like '%FBA%'
+and productStateName = '正常'
+)
+where max_date =1 
+group by updateTime,sku,sourcechannel,
+skuName,
+warehouseName
+having (on_hand_quantity+transit_inventory)>0

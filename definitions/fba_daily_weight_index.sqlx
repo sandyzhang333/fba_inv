@@ -1,0 +1,124 @@
+config {
+  type: "table", 
+  schema: "fba_restock_dataset",  
+  name: "fba_daily_weight_index"
+}
+
+WITH MaxPurchaseDate AS (
+    SELECT 
+        MAX(DATE(sale_date)) AS max_purchase_date 
+    FROM 
+        ${ref("recently_Nday_sales")} # 日期要对齐销售底表
+),
+date_dimension AS
+(SELECT 
+    DATE_ADD(max_purchase_date, INTERVAL n DAY) AS sale_date
+FROM 
+    MaxPurchaseDate,
+    UNNEST(GENERATE_ARRAY(-30, 0)) AS n  -- 生成 -45 到 0 的数组 
+WHERE
+    DATE_ADD(max_purchase_date, INTERVAL n DAY) 
+    BETWEEN DATE_SUB(max_purchase_date, INTERVAL 30 DAY) AND max_purchase_date),
+
+#组合日期与销售数据，确保每个 SKU 对应每个日期
+sales_base_data as
+(    SELECT 
+        d.sale_date,
+        s.SPU,
+        COALESCE(SUM(sd.steady_quantity), 0) AS steady_quantity,      
+        COALESCE(SUM(sd.sales_quantity), 0) AS sales_quantity,  
+    FROM 
+        date_dimension d
+    CROSS JOIN 
+        (SELECT DISTINCT SPU, product_name
+        FROM ${ref("recently_Nday_sales")}) s
+    LEFT JOIN 
+        ${ref("recently_Nday_sales")} sd 
+        ON d.sale_date = sd.sale_date AND s.SPU = sd.SPU
+    GROUP BY 
+        d.sale_date, s.SPU, s.product_name
+    ORDER BY SPU,sale_date),
+
+daily_sales AS (
+    SELECT 
+        sale_date,
+        SPU,
+        CASE 
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 2 THEN 'Monday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 3 THEN 'Tuesday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 4 THEN 'Wednesday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 5 THEN 'Thursday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 6 THEN 'Friday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 7 THEN 'Saturday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 1 THEN 'Sunday'
+        END AS day_of_week,
+        CASE 
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 2 THEN '1'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 3 THEN '2'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 4 THEN '3'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 5 THEN '4'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 6 THEN '5'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 7 THEN '6'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 1 THEN '7'
+        END AS day_of_num,
+        EXTRACT(YEAR FROM DATE_TRUNC(sale_date, WEEK(MONDAY))) AS year,
+        EXTRACT(WEEK(MONDAY) FROM sale_date) AS week,
+        SUM(steady_quantity) AS total_sales
+    FROM 
+------------------自发货和亚马逊的销售订单-----消除波动的计算---------------------------------
+    sales_base_data
+------------------自发货和亚马逊的销售订单--------------------------------------
+    GROUP BY 
+        sale_date, SPU
+),
+
+week_days AS (
+    SELECT "1" AS day_of_num, 'Monday' AS day_of_week
+    UNION ALL
+    SELECT "2", 'Tuesday'
+    UNION ALL
+    SELECT "3", 'Wednesday'
+    UNION ALL
+    SELECT "4", 'Thursday'
+    UNION ALL
+    SELECT "5", 'Friday'
+    UNION ALL
+    SELECT "6", 'Saturday'
+    UNION ALL
+    SELECT "7", 'Sunday'
+)
+
+-- 计算每个 SPU 的权重索引
+SELECT
+wd.day_of_num,
+wd.day_of_week,
+spu_list.SPU,
+ifnull(weight_index,1.0) as weight_index,
+FROM
+    week_days wd
+CROSS JOIN 
+(SELECT DISTINCT SPU FROM daily_sales) spu_list  
+LEFT JOIN
+(SELECT
+day_of_num,
+day_of_week,
+SPU,
+ROUND(AVG_sales/NULLIF(min_sales,0),2) weight_index,
+FROM
+(SELECT 
+*,
+MIN(AVG_sales)over(partition by SPU) as min_sales
+FROM
+(
+SELECT 
+day_of_num,
+day_of_week,
+SPU,
+round(AVG(total_sales),0) AS AVG_sales,
+FROM daily_sales
+GROUP BY 
+day_of_week,
+day_of_num,
+SPU
+))) h
+on wd.day_of_num = h.day_of_num and spu_list.SPU = h.SPU

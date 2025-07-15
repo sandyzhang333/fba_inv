@@ -1,0 +1,71 @@
+config {
+  type: "table",  
+  schema: "fba_restock_dataset",  
+  name: "fba_arrival_info",
+  tags: ["FBA在途到货表测算","备货模型"]
+}
+
+with tt as 
+(SELECT 
+t.memo,
+name,
+code,
+-- inboundDate, #入库时间
+sp.shipmentId,
+transportName,
+WarehouseId,
+fba_warehouseName,
+status,
+FBA_goods_status, # FBA是否处于关闭状态
+sp.sku,
+sp.msku,
+sp.quantity as shipped_qty, #发货数量
+sp.receiptQuantity ,#收货数量
+(sp.quantity - sp.receiptQuantity) as quantity,   # 未接收的数量  后续分 在途/处理 以状态判断
+sp.receiptQuantity,# 已收货数量
+ifnull(date(t.confirmShipmentDate), shipmentDate) as t_shipmentDate, # 如果没有确认运出日期，就用计划的日期
+case when 
+  ifnull(date(actualArrivalDate), t.expectArrivalDate) < CURRENT_DATE()
+  then CURRENT_DATE()+3# 早于当前日期到货的但未处理到库上架，直接当作是在未来日子处理中
+  else ifnull(date(actualArrivalDate), t.expectArrivalDate)+3 #预计到仓后上架时间，默认3天处理
+  end as t_arrivalDate,
+shipmentDate,
+t.confirmShipmentDate,
+receiptDate,  #收货时间
+t.expectArrivalDate, #预计到仓时间
+ceiling(avg(DATETIME_DIFF(date(t.expectArrivalDate),date(t.confirmShipmentDate),day))over(partition by transportName,WarehouseId)) as expect_Shipment ,
+actualArrivalDate, #实际到仓时间
+ceiling(avg(DATETIME_DIFF(date(actualArrivalDate),date(t.confirmShipmentDate),day))over(partition by transportName,WarehouseId)) actual_Shipment ,
+sp.createTime,
+sp.updateTime,
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_ship_delivery_detail` t,
+unnest(t.itemDTOList) sp
+left join(
+SELECT distinct h.code,transportName
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_ship_delivery` h,
+unnest(h.shipmentIdList) sd
+where warehouseType = 'fba'
+) g using(code)
+left join (
+  SELECT 
+  distinct
+  shipmentId ,name, status as FBA_goods_status,warehouseName as fba_warehouseName
+  FROM `articulate-sol-302205.hwc_data_ritfit.jijia_fulfillment_ship_shipment` 
+  WHERE  
+  status NOT in ('CLOSED','CANCELLED','DELETED','ERROR')
+) e
+using(shipmentId)
+where code in(
+SELECT distinct code
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_ship_delivery` 
+where warehouseType = 'fba'
+and status not in ('cancelled','finished') 
+and FBA_goods_status is not null
+))
+
+select sku as spu
+,right(fba_warehouseName,6) as sourcechannel 
+,t_arrivalDate as arrivalDate
+,sum(quantity) as quantity 
+from tt 
+group by sku,t_arrivalDate,sourcechannel

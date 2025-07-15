@@ -1,0 +1,48 @@
+config {
+  type: "table",  
+  schema: "fba_restock_dataset",  
+  name: "fba_inventory_sales_combine",
+  tags: ["产品库存与销售的情况结合", "备货模型"]
+}
+
+with fba_inventory_2 as
+(select 
+updateTime,
+sku as spu,
+skuName,
+warehouseName,
+sourcechannel,
+sum(on_hand_quantity) as on_hand_quantity,
+sum(transit_inventory) as transit_inventory,
+if(sum(on_hand_quantity) = 0 , 0,sum(inventoryAge6to9Month+inventoryAge9to12Month)/ sum(on_hand_quantity)) as unsalable_rate
+from ${ref("fba_inventory")}
+group by 
+updateTime,
+spu,
+skuName,
+warehouseName,
+sourcechannel)
+
+
+select 
+updateTime,
+ifnull(h1.spu,h2.spu) as spu,
+product_name,
+ifnull(h1.sourcechannel,h2.sourcechannel) as sourcechannel,
+on_hand_quantity,
+transit_inventory,
+unsalable_rate,
+up_level_45d,
+down_level_45d,
+daily_sales,
+steady_daily_sales,
+sales_quantity as sales_qty_30d,
+h3.agg_info as shipped_info
+from fba_inventory_2 h1
+left join 
+${ref("product_sales_final")} h2
+on h1.spu = h2.spu and h1.sourceChannel =h2.sourceChannel
+left join 
+${ref("product_shipping_info")} h3
+on h1.spu = h3.spu and h1.sourceChannel =h3.sourceChannel
+where daily_sales> 0 or steady_daily_sales >0   

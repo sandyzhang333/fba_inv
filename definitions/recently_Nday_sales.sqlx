@@ -1,0 +1,34 @@
+config {
+  type: "table", 
+  schema: "fba_restock_dataset",  
+  name: "recently_Nday_sales",
+  tags: ["产品销量涨幅测算", "备货模型"]
+}
+
+with step_1 as 
+(select *,
+if(growth_level is null,sales_quantity,avg_spu_sales) steady_quantity,
+if(growth_level is null ,null , if(sales_quantity > avg_spu_sales,'up','down')) growth_type
+from
+(select *
+,if(covar_r>covar_all,round(sales_quantity/avg_spu_sales,2),null) growth_level,
+from
+(( select * 
+,(sales_quantity-avg_spu_sales) *(sales_quantity-avg_spu_sales) as covar_r 
+,avg((sales_quantity-avg_spu_sales) *(sales_quantity-avg_spu_sales))over(partition by spu, sourceChannel) covar_all
+ from
+( SELECT *,round(AVG(sales_quantity)OVER(PARTITION BY spu, sourceChannel),0) avg_spu_sales 
+ from
+  ${ref("productsales_fba_60d")} ))
+))) 
+
+select 
+sale_date,
+SPU,
+sourceChannel,
+product_name,
+sales_quantity,
+steady_quantity,
+round(avg(if(growth_type = 'up',growth_level,null))over(partition by spu, sourceChannel),2) up_level_45d,
+round(avg(if(growth_type = 'down',growth_level,null))over(partition by spu, sourceChannel),2) down_level_45d
+from  step_1

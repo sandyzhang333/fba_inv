@@ -1,0 +1,154 @@
+config {
+  type: "table", 
+  schema: "fba_restock_dataset",  
+  name: "fba_predi_result"
+}
+
+WITH MaxPurchaseDate AS (
+    SELECT 
+        MAX(DATE(sale_date)) AS max_purchase_date 
+    FROM 
+        ${ref("recently_Nday_sales")} # 日期要对齐销售底表
+)
+,
+date_dimension AS
+(SELECT 
+    DATE_ADD(max_purchase_date, INTERVAL n DAY) AS sale_date
+FROM 
+    MaxPurchaseDate,
+    UNNEST(GENERATE_ARRAY(-30, 0)) AS n  -- 生成 -45 到 0 的数组 
+WHERE
+    DATE_ADD(max_purchase_date, INTERVAL n DAY) 
+    BETWEEN DATE_SUB(max_purchase_date, INTERVAL 30 DAY) AND max_purchase_date)
+    ,
+
+
+#组合日期与销售数据，确保每个 SKU 对应每个日期
+sales_base_data as
+(    SELECT 
+        d.sale_date,
+        s.SPU,
+        s.sourcechannel,
+        s.product_name, 
+        COALESCE(SUM(sd.steady_quantity), 0) AS steady_quantity,      
+        COALESCE(SUM(sd.sales_quantity), 0) AS sales_quantity,  
+    FROM 
+        date_dimension d
+    CROSS JOIN 
+        (SELECT DISTINCT SPU, sourcechannel,product_name
+        FROM ${ref("recently_Nday_sales")}) s
+    LEFT JOIN 
+        ${ref("recently_Nday_sales")} sd 
+        ON d.sale_date = sd.sale_date AND s.SPU = sd.SPU and s.sourcechannel = sd.sourcechannel
+    GROUP BY 
+        d.sale_date, s.SPU,s.sourcechannel, s.product_name
+    ORDER BY SPU,sale_date)
+    ,
+
+sales_2_data AS
+( SELECT 
+        sale_date,
+        SPU,
+        sourcechannel,
+        product_name, 
+        CASE 
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 2 THEN 'Monday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 3 THEN 'Tuesday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 4 THEN 'Wednesday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 5 THEN 'Thursday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 6 THEN 'Friday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 7 THEN 'Saturday'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 1 THEN 'Sunday'
+        END AS day_of_week,
+        CASE 
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 2 THEN '1'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 3 THEN '2'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 4 THEN '3'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 5 THEN '4'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 6 THEN '5'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 7 THEN '6'
+            WHEN EXTRACT(DAYOFWEEK FROM sale_date) = 1 THEN '7'
+        END AS day_of_num,
+        EXTRACT(YEAR FROM DATE_TRUNC(sale_date, WEEK(MONDAY))) AS year,
+        EXTRACT(WEEK(MONDAY) FROM sale_date) AS week,
+        SUM(sales_quantity) AS total_sales
+    FROM 
+------------------自发货和亚马逊的销售订单-----消除波动的计算---------------------------------
+    sales_base_data 
+------------------自发货和亚马逊的销售订单--------------------------------------
+    GROUP BY 
+        sale_date, SPU, sourcechannel, product_name)
+        ,
+
+week_dates AS (
+    SELECT 
+        DATE_ADD(DATE_TRUNC(CURRENT_DATE(), YEAR), INTERVAL 
+        (select max(week) from sales_2_data where EXTRACT(YEAR FROM CURRENT_DATE()) = year ) * 7 - 7 DAY) AS week_start_date  -- 计算预测周的起始日期
+)
+,
+
+predi_date as 
+(SELECT 
+    DATE_ADD(week_start_date, INTERVAL n DAY) AS sale_date,  
+    CASE 
+        WHEN EXTRACT(DAYOFWEEK FROM DATE_ADD(week_start_date, INTERVAL n DAY)) = 1 THEN 7 
+        ELSE EXTRACT(DAYOFWEEK FROM DATE_ADD(week_start_date, INTERVAL n DAY)) - 1 
+    END AS weekday_number  
+FROM 
+    week_dates,
+    UNNEST(GENERATE_ARRAY(0, 6)) AS n  ),
+
+predi_data as 
+(select spu,sourcechannel,
+product_name,
+(predi_w+1) as predi_week,
+ROUND(SUM(CASE 
+    WHEN r = 1 THEN total_sales * 0.5  -- 最近
+    WHEN r = 2 THEN total_sales * 0.3  -- 中间
+    WHEN r = 3 THEN total_sales * 0.2  -- 最远
+    ELSE 0
+END),2) AS predi_week_sales,
+from
+(
+    select 
+    *,
+    (select max(week) from sales_2_data where EXTRACT(YEAR FROM CURRENT_DATE()) = year)  as predi_w,
+    ROW_NUMBER() OVER (PARTITION BY SPU, sourcechannel ORDER BY year desc, week DESC) AS r
+    from
+    (SELECT
+    spu,
+    sourcechannel,
+    product_name,
+    week,
+    year,
+    sum(total_sales) as total_sales
+    from
+    (
+    SELECT *,
+    COUNT(week)OVER(PARTITION BY SPU, WEEK, sourcechannel,year) AS C,
+    max(week)over(PARTITION BY year) max_w
+    FROM sales_2_data 
+    )
+    where (max_w-week)<=3 and c= 7 
+    group by spu,sourcechannel,week,product_name,year
+)
+)
+group by predi_week,spu,sourcechannel,product_name
+)
+
+select 
+b.spu,
+b.sourcechannel,
+product_name,
+sale_date,
+predi_week,
+round(weight_index / NULLIF(sum(weight_index)over(partition by b.spu,b.sourcechannel),0) *predi_week_sales,2) as predi_day_sales
+from 
+predi_date a
+cross join 
+predi_data b
+left join 
+${ref("fba_daily_weight_index")} c
+on cast(a.weekday_number as string) = c.day_of_num and b.spu = c.spu
+-- where b.spu = 'RF-RPLATE-5LB'
+order by b.spu,day_of_num

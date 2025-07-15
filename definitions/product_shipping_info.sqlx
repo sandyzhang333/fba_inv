@@ -1,0 +1,112 @@
+config {
+  type: "table", 
+  schema: "fba_restock_dataset",  
+  name: "product_shipping_info",
+  tags: ["FBA货件/出货表","备货模型"]
+}
+
+with tt as 
+(select 
+sku,
+shipmentId,
+createTime,
+FBA_status,
+code,
+status, 
+if(shipmentId is not null and code is null,if(FBA_status in('IN_TRANSIT','SHIPPED'),'FBA出货','未出货'), '已出货') as if_shipped,
+-- lower(ifnull(status, FBA_status)) as delivery_status,
+name,
+right(warehouseName,6) as sourcechannel,
+transportName,
+quantityShipped,
+quantityReceived,
+declareReceiveDiff,
+t_shipmentDate,
+t_arrivalDate
+
+ from
+
+(SELECT 
+createTime,
+t.id,
+t.name,
+t.shipmentId,
+type,
+status as FBA_status,
+sd.sku,
+warehouseName,
+expectedDeliveryDate,
+updatedExpectedDeliveryDate,
+actualDeliveryDate,
+receivingAt, #开始收货时间
+sd.quantityShipped as quantityShipped, #申报量
+sd.quantityReceived, #已收量
+sd.declareReceiveDiff, # 申收差异
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_fulfillment_ship_shipment`  t,
+unnest (t.shipmentDetailVos ) as sd
+order by receivingAt desc , declareReceiveDiff desc) a
+left join
+(SELECT 
+t.memo,
+code,
+sp.shipmentId,
+transportName,
+status,
+sp.sku,
+sp.quantity ,#数量
+sp.receiptQuantity, # 已收货数量
+sp.handleDiffQuantity,
+shipmentDate,
+t.confirmShipmentDate,
+receiptDate,  #收货时间
+t.expectArrivalDate, #预计到仓时间
+ifnull(date(t.confirmShipmentDate), shipmentDate) as t_shipmentDate, # 如果没有确认运出日期，就用计划的日期
+case 
+  when actualArrivalDate is not null then date(actualArrivalDate)
+  when ifnull(date(actualArrivalDate), t.expectArrivalDate) < CURRENT_DATE()
+  then CURRENT_DATE()+3# 早于当前日期到货的但未处理到库上架，直接当作是在未来日子处理中
+  else ifnull(date(actualArrivalDate), t.expectArrivalDate)+3 #预计到仓后上架时间，默认3天处理
+  end as t_arrivalDate,
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_ship_delivery_detail` t,
+unnest(t.itemDTOList) sp
+left join(  
+SELECT distinct h.code,transportName,WarehouseName
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_ship_delivery`  h,
+unnest(WarehouseNames) WarehouseName
+where warehouseType = 'fba'
+) g using(code)
+where code in(
+SELECT distinct code
+FROM `articulate-sol-302205.hwc_data_ritfit.jijia_erp_ship_delivery` 
+where warehouseType = 'fba'
+)) b
+using(shipmentId,sku)
+where 
+upper(lower(ifnull(status, FBA_status))) not in ('CLOSED','CANCELLED','DELETED','ERROR','FINISHED') 
+AND warehouseName != 'RF-Walmart:US_WFS'
+and not (lower(ifnull(status, FBA_status))  = 'receiving' AND code IS NULL and declareReceiveDiff <= 0) # 去掉有收货状态(但无发货单)，收货已经结束的
+)
+
+select 
+sku as SPU,
+sourcechannel,
+ ARRAY_AGG(STRUCT(
+    shipmentId,
+    createTime,
+    FBA_status,
+    code,
+    status,
+    if_shipped,
+    name,
+    transportName,
+    quantityShipped,
+    quantityReceived,
+    declareReceiveDiff,
+    t_shipmentDate,
+    t_arrivalDate
+  )ORDER BY createTime DESC) AS agg_info
+from tt
+group by
+sku,
+sourcechannel
+

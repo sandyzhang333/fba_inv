@@ -1,0 +1,68 @@
+config {
+  type: "table",  
+  schema: "fba_restock_dataset",  
+  name: "product_sales_final",
+  tags: ["近30d产品销量/加权日销表", "备货模型"]
+}
+
+WITH MaxPurchaseDate AS (
+    SELECT 
+        MAX(DATE(purchaseDate)) AS max_purchase_date 
+    FROM 
+        `articulate-sol-302205.hwc_data_ritfit.jijia_erp_order_list_detail`
+),
+date_dimension AS
+(SELECT 
+    DATE_ADD(max_purchase_date, INTERVAL n DAY) AS sale_date
+FROM 
+    MaxPurchaseDate,
+    UNNEST(GENERATE_ARRAY(-30, 0)) AS n  -- 生成 -30 到 0 的数组 
+WHERE
+    DATE_ADD(max_purchase_date, INTERVAL n DAY) 
+    BETWEEN DATE_SUB(max_purchase_date, INTERVAL 30 DAY) AND max_purchase_date),
+
+
+sales_orderbydate AS (
+    SELECT 
+        ROW_NUMBER() OVER (PARTITION BY s.SPU,s.sourceChannel ORDER BY d.sale_date DESC) AS rn,
+        d.sale_date,
+        s.SPU,
+        s.sourceChannel,
+        s.product_name,
+        AVG(up_level_45d) as up_level_45d,
+        AVG(down_level_45d) as down_level_45d,
+        COALESCE(SUM(sd.steady_quantity), 0) AS steady_quantity,      
+        COALESCE(SUM(sd.sales_quantity), 0) AS sales_quantity,  
+    FROM 
+        date_dimension d
+    CROSS JOIN 
+        (SELECT DISTINCT SPU,sourceChannel, product_name
+        FROM ${ref("recently_Nday_sales")}) s
+    LEFT JOIN 
+        ${ref("recently_Nday_sales")} sd 
+        ON d.sale_date = sd.sale_date AND s.SPU = sd.SPU AND s.sourceChannel = sd.sourceChannel
+    GROUP BY 
+        d.sale_date, s.SPU,s.sourceChannel, s.product_name
+        )
+
+SELECT
+    SPU,
+    sourceChannel,
+    r.product_name,
+    avg(up_level_45d) as up_level_45d,
+    avg(down_level_45d) as down_level_45d, 
+    round(
+        (SUM(CASE WHEN r.rn <= 7 THEN r.sales_quantity ELSE 0 END) / 7.0 * 0.5 +
+         SUM(CASE WHEN r.rn <= 15 THEN r.sales_quantity ELSE 0 END) / 14.0 * 0.3 +
+         SUM(CASE WHEN r.rn <= 30 THEN r.sales_quantity ELSE 0 END) / 28.0 * 0.2) , 2
+    ) AS daily_sales,
+    round(
+        (SUM(CASE WHEN r.rn <= 7 THEN r.steady_quantity ELSE 0 END) / 7.0 * 0.5 +
+         SUM(CASE WHEN r.rn <= 15 THEN r.steady_quantity ELSE 0 END) / 14.0 * 0.3 +
+         SUM(CASE WHEN r.rn <= 30 THEN r.steady_quantity ELSE 0 END) / 28.0 * 0.2) , 2
+    ) AS steady_daily_sales,
+    NULLIF(SUM(r.sales_quantity), 0) AS sales_quantity
+FROM
+    sales_orderbydate r
+GROUP BY
+    r.SPU,sourceChannel, r.product_name
